@@ -134,7 +134,7 @@ video-to-pdf-app/
 ├── video_processor.py        # Core processing logic
 │
 ├── requirements.txt          # Python dependencies
-├── Dockerfile.vercel         # Vercel container configuration
+├── Dockerfile         # Vercel container configuration
 ├── tests/                    # Offline processor tests
 ├── README.md                 # Project overview & usage instructions
 └── .gitignore                # Ignore venv and generated conversion files
@@ -184,11 +184,11 @@ streamlit run streamlit_app.py
 
 ## ▲ Deploy on Vercel (from GitHub)
 
-This repository includes a `Dockerfile.vercel` so Vercel can run the Streamlit server with the system tools required by the processor (`ffmpeg` and Tesseract OCR).
+This repository includes a `Dockerfile` so Vercel can run the Streamlit server with the system tools required by the processor (`ffmpeg` and Tesseract OCR).
 
 1. Push the completed project to GitHub. Do not commit generated videos, slide folders, PDFs, virtual environments, or `.env` files.
 2. In Vercel, choose **Add New → Project**, import this repository, and retain the repository root (`./`) as the root directory.
-3. Vercel detects `Dockerfile.vercel` at the project root. Use the container/Other preset rather than a standard Python function; do not override the Docker build command.
+3. Vercel detects `Dockerfile` at the project root. Use the container/Other preset rather than a standard Python function; do not override the Docker build command.
 4. Click **Deploy**. Future pushes to the selected production branch deploy automatically.
 
 The app writes each job's downloaded video, slides, and final PDF to an isolated temporary directory below `/tmp/ai-video-to-pdf`, rather than the deployed source directory. The downloaded source video is deleted once processing completes.
@@ -198,7 +198,7 @@ The app writes each job's downloaded video, slides, and final PDF to an isolated
 ### Local container test
 
 ```bash
-docker build -f Dockerfile.vercel -t ai-video-to-pdf .
+docker build -t ai-video-to-pdf .
 docker run --rm -p 8501:80 ai-video-to-pdf
 ```
 

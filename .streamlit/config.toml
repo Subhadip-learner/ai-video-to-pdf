@@ -1,5 +1,5 @@
 # Server settings for hosted deployments (Vercel container, Docker).
-# Command-line flags in Dockerfile.vercel take precedence over these
+# Command-line flags in Dockerfile take precedence over these
 # values; this file keeps `streamlit run streamlit_app.py` working
 # with sane defaults everywhere else.
 [server]
