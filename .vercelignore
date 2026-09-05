@@ -1,0 +1,25 @@
+# Files Vercel does not need for this deployment.
+.git/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.vscode/
+.idea/
+
+# Generated conversion artifacts are never deployed.
+*_slides/
+*_notes.pdf
+*.mp4
+*.m4v
+*.mkv
+*.webm
+*.avi
+*.part
+
+# Local-only configuration.
+.env
+.env.*
+tests/

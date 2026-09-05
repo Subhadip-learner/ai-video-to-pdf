@@ -1,0 +1,12 @@
+# Server settings for hosted deployments (Vercel container, Docker).
+# Command-line flags in Dockerfile.vercel take precedence over these
+# values; this file keeps `streamlit run streamlit_app.py` working
+# with sane defaults everywhere else.
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+maxUploadSize = 50
+
+[browser]
+gatherUsageStats = false
