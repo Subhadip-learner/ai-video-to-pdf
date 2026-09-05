@@ -1,0 +1,23 @@
+.git
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+
+# Generated conversion files
+*_slides/
+*_notes.pdf
+*.mp4
+*.m4v
+*.mkv
+*.webm
+*.avi
+*.part
+
+# Local secrets and editor files
+.env
+.env.*
+.vscode
+.idea

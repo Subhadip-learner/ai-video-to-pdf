@@ -184,11 +184,9 @@ def main():
                     help="Higher quality = better results but longer processing time"
                 )
                 
-                # Allow user to optionally upload a PDF to "train" or guide the extraction
-                pdf_file = st.file_uploader(
-                    "**Training PDF (Optional)**",
-                    type=['pdf'],
-                    help="Upload a PDF with perfect slides to train the AI model for better detection"
+                st.info(
+                    "Frames are selected using visual similarity, sharpness, and optional OCR. "
+                    "Reference-PDF training is not available in this version."
                 )
             
             # Visual separator inside the form
@@ -215,8 +213,8 @@ def main():
     with col1:
         st.markdown("""
         <div class="feature-card">
-            <h3>🎯 Multiple AI Models</h3>
-            <p>CLIP, Object Detection, OCR for optimal slide detection</p>
+            <h3>🎯 Smart Frame Selection</h3>
+            <p>Uses sharpness and visual similarity to retain useful frames</p>
         </div>
         """, unsafe_allow_html=True)
         st.markdown("""
@@ -236,8 +234,8 @@ def main():
         """, unsafe_allow_html=True)
         st.markdown("""
         <div class="feature-card">
-            <h3>🔍 Semantic Understanding</h3>
-            <p>Deep learning for content understanding</p>
+            <h3>🛟 Reliable Fallback</h3>
+            <p>Uniform sampling helps ensure a PDF is produced for static videos</p>
         </div>
         """, unsafe_allow_html=True)
 
@@ -318,7 +316,7 @@ def main():
                 processor = OptimizedVideoProcessor()  # instantiate the video processor
 
                 # Run the full processing pipeline (downloads video, extracts frames, creates PDF)
-                pdf_output = processor.process_video_to_pdf(video_url, content_name)
+                pdf_output = processor.process_video_to_pdf(video_url, content_name, quality=quality)
                 
                 # After run, check if a PDF was created and exists on disk
                 if pdf_output and os.path.exists(pdf_output):
@@ -349,18 +347,19 @@ def main():
                     # Provide a download button for the generated PDF
                     st.markdown("### 📥 Download Your PDF")
                     with open(pdf_output, "rb") as f:
-                        st.download_button(
-                            label=f"📄 Download {content_name}.pdf",  # button label
-                            data=f,                                 # file-like object
-                            file_name=f"{content_name}.pdf",        # suggested download name
-                            mime="application/pdf",                 # content-type
-                            use_container_width=True
-                        )
-                        # Play balloons as a small celebration
-                        st.balloons()
+                        pdf_data = f.read()
+                    st.download_button(
+                        label=f"📄 Download {os.path.basename(pdf_output)}",
+                        data=pdf_data,
+                        file_name=os.path.basename(pdf_output),
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+                    # Play balloons as a small celebration
+                    st.balloons()
                 else:
-                    # PDF was not created — show an error
-                    st.error("❌ Failed to create PDF. Please try another video.")
+                    # Show a useful processor error when one is available.
+                    st.error(processor.last_error or "❌ Failed to create PDF. Please try another video.")
         
         except Exception as e:
             # Catch-all errors are shown in the UI rather than raising an unhandled exception

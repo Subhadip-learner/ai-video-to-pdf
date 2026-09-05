@@ -1,338 +1,459 @@
-# Import required libraries
-import cv2            # OpenCV: used for video processing (reading frames, edge detection, etc.)
-import img2pdf        # For converting extracted images into a single PDF
-import os             # File and folder handling (create dirs, delete files, etc.)
-import glob           # For matching file patterns (not directly used here, but usually for listing files)
-import yt_dlp         # To download YouTube videos (replacement of youtube-dl)
-import time           # For timing execution (used to calculate processing time)
-import numpy as np    # For numerical operations (arrays, histograms, etc.)
+"""Utilities for downloading a public video, selecting useful frames, and creating a PDF.
 
-# Optional OCR support
+All generated files are stored in a unique directory below the operating system temporary
+directory.  This makes the processor safe to use on serverless hosts such as Vercel, where
+the deployed application directory is read-only and only ``/tmp`` can be written to.
+"""
+
+from __future__ import annotations
+
+import re
+import shutil
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Iterable, Optional, Union
+
+import cv2
+import img2pdf
+import numpy as np
+import yt_dlp
+
 try:
-    import pytesseract         # OCR library (extracts text from images)
-    OCR_AVAILABLE = True       # If pytesseract is available, enable OCR
+    import pytesseract
+
+    OCR_AVAILABLE = True
 except Exception:
-    OCR_AVAILABLE = False      # If not installed, disable OCR
+    # Importing pytesseract is optional.  The rest of the pipeline continues without OCR.
+    pytesseract = None
+    OCR_AVAILABLE = False
 
-# -------------------------------
-# Main Class: Handles video → frames → PDF
-# -------------------------------
+
+ImageInfo = dict[str, Any]
+PathLike = Union[str, Path]
+
+
 class SimpleVideoProcessor:
-    def __init__(self,
-                 capture_interval_seconds=5,   # Capture 1 frame every 5 seconds by default
-                 similarity_threshold=0.90,    # If histogram correlation > 0.9 → frames considered similar
-                 replace_sharpness_factor=1.10,# New frame must be at least 10% sharper to replace
-                 replace_text_extra=10,        # New frame must contain 10+ more text characters
-                 min_sharpness=50):            # Minimum sharpness to consider a frame valid
-        """
-        Initializes the processor with thresholds for frame selection.
-        """
-        self.capture_interval_seconds = capture_interval_seconds
-        self.similarity_threshold = similarity_threshold
-        self.replace_sharpness_factor = replace_sharpness_factor
-        self.replace_text_extra = replace_text_extra
-        self.min_sharpness = min_sharpness
+    """Convert a public video URL into a PDF containing distinct, useful frames.
 
-        # Store statistics for processing summary
+    A processor instance is intended for one conversion job.  It creates an isolated
+    temporary workspace when processing begins.  Call :meth:`cleanup` after the caller no
+    longer needs the generated PDF; the Streamlit UI deliberately retains it long enough for
+    the user to download it.
+    """
+
+    VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpeg", ".mpg"}
+
+    def __init__(
+        self,
+        capture_interval_seconds: float = 5,
+        similarity_threshold: float = 0.90,
+        replace_sharpness_factor: float = 1.10,
+        replace_text_extra: int = 10,
+        min_sharpness: float = 50,
+    ) -> None:
+        self.capture_interval_seconds = max(0.25, float(capture_interval_seconds))
+        self.similarity_threshold = float(similarity_threshold)
+        self.replace_sharpness_factor = max(1.0, float(replace_sharpness_factor))
+        self.replace_text_extra = max(0, int(replace_text_extra))
+        self.min_sharpness = max(0.0, float(min_sharpness))
+
         self.processing_stats = {
-            'total_frames': 0,     # Total frames in the video
-            'key_frames': 0,       # Frames finally saved
-            'video_duration': 0    # Duration of video in seconds
+            "total_frames": 0,
+            "key_frames": 0,
+            "video_duration": 0.0,
         }
+        self.workspace_dir: Optional[Path] = None
+        self.last_error: Optional[str] = None
 
-    # (utility methods such as _frame_sharpness, _edge_density, _text_amount,
-    #  _histogram, _hist_correlation, and _is_new_better go here)
-    # Assume they exist above as in your original file.
+    @property
+    def stats(self) -> dict[str, Union[int, float]]:
+        """Backward-compatible name used by the Streamlit interface."""
+        return self.processing_stats
 
-    # ---------- Step 2: Extract key frames ----------
-    def extract_best_frames(self, video_path, output_name):
+    # ---------- Workspace and filename helpers ----------
+    @staticmethod
+    def _safe_filename(value: str, default: str = "video_notes") -> str:
+        """Return a portable filename stem, never a user-controlled path."""
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+        cleaned = cleaned.strip("._-")[:80]
+        return cleaned or default
+
+    def _create_workspace(self) -> Path:
+        """Create (once) the writable temporary directory for this job."""
+        if self.workspace_dir is None:
+            base_dir = Path(tempfile.gettempdir()) / "ai-video-to-pdf"
+            base_dir.mkdir(parents=True, exist_ok=True)
+            self.workspace_dir = Path(tempfile.mkdtemp(prefix="job-", dir=base_dir))
+        return self.workspace_dir
+
+    def cleanup(self) -> None:
+        """Remove all temporary files belonging to this conversion job."""
+        if self.workspace_dir and self.workspace_dir.exists():
+            shutil.rmtree(self.workspace_dir, ignore_errors=True)
+        self.workspace_dir = None
+
+    def _slides_directory(self, output_name: str) -> Path:
+        directory = self._create_workspace() / f"{self._safe_filename(output_name)}_slides"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    # ---------- Frame-quality helpers ----------
+    @staticmethod
+    def _frame_sharpness(frame: np.ndarray) -> float:
+        """Measure focus using the variance of the Laplacian (higher is sharper)."""
+        if frame is None or frame.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    @staticmethod
+    def _edge_density(frame: np.ndarray) -> float:
+        """Return the fraction of pixels that are strong Canny edges."""
+        if frame is None or frame.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 100, 200)
+        return float(np.count_nonzero(edges)) / float(edges.size or 1)
+
+    @staticmethod
+    def _histogram(frame: np.ndarray) -> np.ndarray:
+        """Build a normalized HSV histogram for visual similarity comparison."""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        histogram = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 8], [0, 180, 0, 256, 0, 256])
+        return cv2.normalize(histogram, histogram).flatten()
+
+    @staticmethod
+    def _hist_correlation(hist1: np.ndarray, hist2: np.ndarray) -> float:
+        """Return OpenCV histogram correlation, where 1.0 means identical."""
+        if hist1 is None or hist2 is None:
+            return -1.0
+        return float(cv2.compareHist(hist1.astype("float32"), hist2.astype("float32"), cv2.HISTCMP_CORREL))
+
+    @staticmethod
+    def _text_amount(frame: np.ndarray) -> tuple[int, str]:
+        """OCR a frame and return its non-whitespace character count and text.
+
+        pytesseract can be importable while the system Tesseract binary is missing.  In that
+        case its exception is caught by the caller and OCR simply contributes no score.
         """
-        Go through video and pick best frames based on sharpness, similarity, and text.
-        This method:
-          - Opens video
-          - Samples frames every capture_interval_seconds
-          - Skips blurry frames
-          - Uses histogram correlation to detect similarity to last saved
-          - Saves distinct frames, and replaces the last saved if a similar-but-better frame appears
-        Returns:
-          - captured: list of dicts with metadata for each saved frame
+        if not OCR_AVAILABLE or pytesseract is None:
+            return 0, ""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        text = pytesseract.image_to_string(gray, config="--psm 6")
+        normalized_text = " ".join(text.split())
+        return len(re.sub(r"\s+", "", normalized_text)), normalized_text
+
+    def _is_new_better(self, new_info: ImageInfo, previous_info: ImageInfo) -> bool:
+        """Decide whether a visually similar frame improves the already saved frame."""
+        old_sharpness = max(float(previous_info.get("sharpness", 0.0)), 1.0)
+        new_sharpness = float(new_info.get("sharpness", 0.0))
+        old_text = int(previous_info.get("text_amount", 0))
+        new_text = int(new_info.get("text_amount", 0))
+        old_edges = max(float(previous_info.get("edge_density", 0.0)), 1e-6)
+        new_edges = float(new_info.get("edge_density", 0.0))
+
+        noticeably_sharper = new_sharpness >= old_sharpness * self.replace_sharpness_factor
+        substantially_more_text = new_text >= old_text + self.replace_text_extra
+        clearer_structure = (
+            new_edges >= old_edges * 1.20 and new_sharpness >= old_sharpness * 0.95
+        )
+        return noticeably_sharper or substantially_more_text or clearer_structure
+
+    # ---------- Download ----------
+    @staticmethod
+    def _quality_height(quality: Optional[str]) -> int:
+        match = re.search(r"(\d+)", quality or "")
+        return int(match.group(1)) if match else 720
+
+    def download_video(self, video_url: str, content_name: str, quality: str = "720p") -> Optional[str]:
+        """Download one public video into this job's temporary workspace.
+
+        ``content_name`` is retained in the signature for compatibility.  Downloaded source
+        filenames are intentionally fixed and are never built from user input.
         """
-        # open the video captured by OpenCV
-        cap = cv2.VideoCapture(video_path)
-        # if unable to open (bad path, unsupported file) -> bail out
-        if not cap.isOpened():
-            print("❌ Cannot open video file")
+        if not video_url or not video_url.strip():
+            self.last_error = "A video URL is required."
             return None
 
-        # read video properties safely, fallback to sensible defaults
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0  # frames per second
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)  # total frame count
-        duration = (total_frames / fps) if fps else 0  # duration in seconds
+        workspace = self._create_workspace()
+        max_height = self._quality_height(quality)
+        output_template = str(workspace / "source.%(ext)s")
+        format_selector = (
+            f"bestvideo[height<={max_height}]+bestaudio/"
+            f"best[height<={max_height}]/best"
+        )
+        options = {
+            "format": format_selector,
+            "outtmpl": output_template,
+            "noplaylist": True,
+            "merge_output_format": "mp4",
+            "restrictfilenames": True,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 30,
+            "retries": 2,
+            "fragment_retries": 2,
+        }
 
-        # store stats for outside use / reporting
-        self.processing_stats['video_duration'] = duration
-        self.processing_stats['total_frames'] = total_frames
-        # log a short summary
-        print(f"🎬 Video Info: {duration:.1f}s, {total_frames} frames, {fps:.1f} FPS")
+        try:
+            with yt_dlp.YoutubeDL(options) as downloader:
+                downloader.extract_info(video_url.strip(), download=True)
+        except Exception as error:
+            self.last_error = f"Video download failed: {error}"
+            print(f"❌ {self.last_error}")
+            return None
 
-        # ensure output directory exists (one folder per run)
-        output_dir = f"{output_name}_slides"
-        os.makedirs(output_dir, exist_ok=True)
+        candidates = [
+            path
+            for path in workspace.iterdir()
+            if path.is_file() and path.suffix.lower() in self.VIDEO_EXTENSIONS
+        ]
+        if not candidates:
+            self.last_error = "The video was downloaded but no supported video file was produced."
+            print(f"❌ {self.last_error}")
+            return None
 
-        captured = []   # list to hold metadata about saved frames
-        last_saved = None  # will hold the last saved frame's info (for comparison)
+        video_file = max(candidates, key=lambda path: path.stat().st_mtime)
+        print(f"✅ Downloaded video: {video_file.name}")
+        return str(video_file)
 
-        # calculate how many frames to skip between samples to achieve the requested seconds interval
-        interval_frames = max(1, int(round(self.capture_interval_seconds * fps)))
+    # ---------- Frame extraction ----------
+    def _frame_info(self, frame: np.ndarray, frame_index: int, fps: float) -> ImageInfo:
+        sharpness = self._frame_sharpness(frame)
+        edge_density = self._edge_density(frame)
+        text_amount, text_content = 0, ""
+        if OCR_AVAILABLE:
+            try:
+                text_amount, text_content = self._text_amount(frame)
+            except Exception as error:
+                # Tesseract is optional, so OCR errors cannot stop PDF generation.
+                print(f"⚠️ OCR skipped: {error}")
 
-        # iterate through the video by jumping to every interval frame
-        for frame_idx in range(0, total_frames, interval_frames):
-            # set the capture position to the current frame index
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            # read the frame
-            ret, frame = cap.read()
-            # if reading failed (end-of-file, corrupt), skip this position
-            if not ret:
-                continue
+        return {
+            "frame": frame,
+            "time": frame_index / (fps or 1.0),
+            "sharpness": sharpness,
+            "edge_density": edge_density,
+            "text_amount": text_amount,
+            "text_content": text_content,
+            "hist": self._histogram(frame),
+        }
 
-            # compute sharpness (Laplacian variance)
-            sharp = self._frame_sharpness(frame)
-            # skip frames that are too blurry to be useful
-            if sharp < self.min_sharpness:
-                continue  # move to next sampled frame
+    @staticmethod
+    def _save_frame(output_dir: Path, frame: np.ndarray, position: int, fallback: bool = False) -> str:
+        prefix = "fallback" if fallback else "slide"
+        destination = output_dir / f"{prefix}_{position:03d}.png"
+        if not cv2.imwrite(str(destination), frame):
+            raise OSError(f"Could not write extracted frame: {destination}")
+        return str(destination)
 
-            # compute structural features and optional OCR
-            edge = self._edge_density(frame)  # how many edges per pixel
-            text_amt, text_content = (0, "")  # defaults if OCR not available
-            if OCR_AVAILABLE:
-                try:
-                    text_amt, text_content = self._text_amount(frame)
-                except Exception:
-                    text_amt, text_content = (0, "")
+    def extract_best_frames(self, video_path: PathLike, output_name: str) -> list[ImageInfo]:
+        """Sample a video and save distinct, sufficiently sharp frames.
 
-            # build a color histogram (HSV) used as a robust similarity metric
-            hist = self._histogram(frame)
-
-            # gather all metadata about this sampled frame in a dict
-            new_info = {
-                'frame': frame,
-                'time': frame_idx / fps,         # timestamp in seconds
-                'sharpness': sharp,
-                'edge_density': edge,
-                'text_amount': text_amt,
-                'text_content': text_content,
-                'hist': hist
-            }
-
-            # If this is the very first saved frame, just save it without comparison
-            if last_saved is None:
-                filename = f"{output_dir}/slide_{len(captured)+1:03d}.png"  # file naming scheme
-                cv2.imwrite(filename, frame)  # write the image file
-                new_info['file'] = filename
-                # append a compact metadata dict to 'captured'
-                captured.append({
-                    'file': filename,
-                    'time': new_info['time'],
-                    'sharpness': sharp,
-                    'edge_density': edge,
-                    'text_amount': text_amt
-                })
-                last_saved = new_info  # track it for future comparisons
-                print(f"📸 Saved (initial) frame at {new_info['time']:.1f}s")
-                continue  # move to next sampled frame
-
-            # Compare similarity between the newly sampled frame and the last saved frame
-            corr = self._hist_correlation(new_info['hist'], last_saved['hist'])
-
-            # If the new frame is sufficiently different (low correlation), save it as a new slide
-            if corr < self.similarity_threshold:
-                filename = f"{output_dir}/slide_{len(captured)+1:03d}.png"
-                cv2.imwrite(filename, frame)
-                new_info['file'] = filename
-                captured.append({
-                    'file': filename,
-                    'time': new_info['time'],
-                    'sharpness': sharp,
-                    'edge_density': edge,
-                    'text_amount': text_amt
-                })
-                last_saved = new_info  # update last_saved to this newly saved frame
-                print(f"📸 Saved distinct frame at {new_info['time']:.1f}s (corr={corr:.3f})")
-                continue  # go to next sample
-
-            # If frames are similar (high correlation) we might still replace the last saved if this one is better
-            if corr >= self.similarity_threshold:
-                # call the decision function that compares sharpness, text amount, and edge density
-                if self._is_new_better(new_info, last_saved):
-                    try:
-                        filename = last_saved.get('file')  # existing filename to overwrite
-                        if filename:
-                            cv2.imwrite(filename, frame)  # overwrite the image with this better frame
-                            # update the metadata of the last captured entry
-                            if captured:
-                                captured[-1].update({
-                                    'time': new_info['time'],
-                                    'sharpness': sharp,
-                                    'edge_density': edge,
-                                    'text_amount': text_amt
-                                })
-                            new_info['file'] = filename
-                            last_saved = new_info  # update last_saved to point to the improved frame
-                            print(f"🔁 Replaced with better frame at {new_info['time']:.1f}s")
-                    except Exception as e:
-                        # if file write fails for any reason, log but continue execution
-                        print(f"⚠️ Replacement failed: {e}")
-                # if not better, simply skip — no file saved and no updates required
-                continue
-
-        # finished sampling -> release the capture resource
-        cap.release()
-
-        # If the algorithm found too few captures (e.g., static video, all blurry), run fallback uniform sampling
-        if len(captured) < 3:
-            print("🔄 Using fallback capture...")
-            fallback = self._fallback_capture(video_path, output_dir, total_frames, fps)
-            # merge fallback frames, ensuring no duplicates by filename
-            for f in fallback:
-                if f['file'] not in [c['file'] for c in captured]:
-                    captured.append(f)
-
-        # update stats and return the list of captured frames metadata
-        self.processing_stats['key_frames'] = len(captured)
-        return captured
-
-    # ---------- Fallback capture ----------
-    def _fallback_capture(self, cap_or_path, output_dir, total_frames, fps):
+        When fewer than three frames are selected, uniform fallback sampling is used.  The
+        fallback keeps usable frames even when the source is uniformly blurry, so a valid
+        video still produces a PDF rather than failing silently.
         """
-        Uniform sampling fallback to ensure that the output contains at least a few frames.
-        This method:
-          - Samples `num_to_capture` frames evenly across the video
-          - Performs the same basic quality checks (sharpness, optional OCR)
-          - Returns a list of metadata dicts for files it writes into output_dir
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            raise ValueError("Cannot open the downloaded video file.")
+
+        try:
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 25.0)
+            total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if total_frames <= 0:
+                raise ValueError("The video contains no readable frames.")
+
+            duration = total_frames / fps
+            self.processing_stats.update(
+                {
+                    "total_frames": total_frames,
+                    "video_duration": duration,
+                    "key_frames": 0,
+                }
+            )
+            print(f"🎬 Video info: {duration:.1f}s, {total_frames} frames, {fps:.1f} FPS")
+
+            output_dir = self._slides_directory(output_name)
+            interval_frames = max(1, int(round(self.capture_interval_seconds * fps)))
+            captured: list[ImageInfo] = []
+            last_saved: Optional[ImageInfo] = None
+
+            for frame_index in range(0, total_frames, interval_frames):
+                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                success, frame = capture.read()
+                if not success or frame is None:
+                    continue
+
+                info = self._frame_info(frame, frame_index, fps)
+                if info["sharpness"] < self.min_sharpness:
+                    continue
+
+                if last_saved is None:
+                    info["file"] = self._save_frame(output_dir, frame, len(captured) + 1)
+                    captured.append(info)
+                    last_saved = info
+                    print(f"📸 Saved initial frame at {info['time']:.1f}s")
+                    continue
+
+                correlation = self._hist_correlation(info["hist"], last_saved["hist"])
+                if correlation < self.similarity_threshold:
+                    info["file"] = self._save_frame(output_dir, frame, len(captured) + 1)
+                    captured.append(info)
+                    last_saved = info
+                    print(f"📸 Saved distinct frame at {info['time']:.1f}s (corr={correlation:.3f})")
+                elif self._is_new_better(info, last_saved):
+                    filename = str(last_saved["file"])
+                    if not cv2.imwrite(filename, frame):
+                        raise OSError(f"Could not replace extracted frame: {filename}")
+                    info["file"] = filename
+                    captured[-1] = info
+                    last_saved = info
+                    print(f"🔁 Replaced with a better frame at {info['time']:.1f}s")
+
+            # A target of three makes short/static videos more useful while respecting very
+            # small files that physically contain fewer frames.
+            target_count = min(3, total_frames)
+            if len(captured) < target_count:
+                print("🔄 Using fallback frame capture...")
+                fallback = self._fallback_capture(
+                    str(video_path),
+                    output_dir,
+                    total_frames,
+                    fps,
+                    count_needed=target_count - len(captured),
+                    existing_times=[float(item["time"]) for item in captured],
+                )
+                captured.extend(fallback)
+
+            captured.sort(key=lambda item: float(item["time"]))
+            self.processing_stats["key_frames"] = len(captured)
+            return captured
+        finally:
+            capture.release()
+
+    def _fallback_capture(
+        self,
+        cap_or_path: Union[PathLike, cv2.VideoCapture],
+        output_dir: PathLike,
+        total_frames: int,
+        fps: float,
+        count_needed: int = 3,
+        existing_times: Optional[Iterable[float]] = None,
+    ) -> list[ImageInfo]:
+        """Uniformly select frames when normal slide detection found too few.
+
+        Quality filtering is deliberately relaxed here.  A non-empty PDF is more helpful
+        than rejecting a valid but low-detail video altogether.
         """
-        captured_frames = []  # will contain metadata for fallback images
-        must_close = False
+        output_path = Path(output_dir)
+        must_close = isinstance(cap_or_path, (str, Path))
+        capture = cv2.VideoCapture(str(cap_or_path)) if must_close else cap_or_path
+        if not capture.isOpened() or total_frames <= 0 or count_needed <= 0:
+            if must_close:
+                capture.release()
+            return []
 
-        # cap_or_path can be either an already-open cv2.VideoCapture or a file path string
-        if isinstance(cap_or_path, str):
-            cap = cv2.VideoCapture(cap_or_path)  # open a new capture if we were passed a path
-            must_close = True
-        else:
-            cap = cap_or_path  # reuse provided capture object
+        try:
+            # Oversample slightly; this helps if a selected position cannot be decoded.
+            sample_count = min(total_frames, max(count_needed * 3, 3))
+            positions = np.linspace(0, total_frames - 1, num=sample_count, dtype=int)
+            seen_positions: set[int] = set()
+            candidates: list[ImageInfo] = []
 
-        # decide how many fallback frames to capture:
-        #   - at most 20
-        #   - at least 1
-        #   - scaled to video length (total_frames // 100)
-        num_to_capture = min(20, max(1, total_frames // 100))
+            for frame_index in positions.tolist():
+                if frame_index in seen_positions:
+                    continue
+                seen_positions.add(frame_index)
+                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                success, frame = capture.read()
+                if not success or frame is None:
+                    continue
+                candidates.append(self._frame_info(frame, frame_index, fps))
 
-        # uniformly sample positions across the entire video
-        for i in range(num_to_capture):
-            # pick a frame index proportional to i
-            frame_idx = int((i / max(1, num_to_capture)) * total_frames)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-            ret, frame = cap.read()
-            if not ret:
-                continue  # skip if unable to read
+            if not candidates:
+                return []
 
-            # quality checks similar to the main pipeline
-            sharp = self._frame_sharpness(frame)
-            if sharp < self.min_sharpness:
-                continue  # skip very blurry frames
+            known_times = list(existing_times or [])
+            # Prefer frames that pass the normal sharpness threshold, but include lower-score
+            # frames if that is all a valid video has.
+            candidates.sort(key=lambda item: float(item["sharpness"]), reverse=True)
+            selected: list[ImageInfo] = []
+            for info in candidates:
+                if len(selected) >= count_needed:
+                    break
+                timestamp = float(info["time"])
+                # Avoid an exact duplicate of a frame already selected by the main pass.
+                if any(abs(timestamp - prior) < 0.01 for prior in known_times):
+                    continue
+                selected.append(info)
+                known_times.append(timestamp)
 
-            edge = self._edge_density(frame)
-            text_amt, _ = (0, "")
-            if OCR_AVAILABLE:
-                try:
-                    text_amt, _ = self._text_amount(frame)
-                except:
-                    text_amt = 0
+            # If every uniform position overlapped with main-pass positions, retain the best
+            # candidates anyway rather than returning an empty fallback.
+            if not selected:
+                selected = candidates[:count_needed]
 
-            # write the fallback image file
-            filename = f"{output_dir}/slide_fb_{len(captured_frames)+1:03d}.png"
-            cv2.imwrite(filename, frame)
-            # append metadata dict for this fallback file
-            captured_frames.append({
-                'file': filename,
-                'time': frame_idx / (fps or 1.0),
-                'sharpness': sharp,
-                'edge_density': edge,
-                'text_amount': text_amt
-            })
+            saved: list[ImageInfo] = []
+            for index, info in enumerate(selected, start=1):
+                info["file"] = self._save_frame(output_path, info["frame"], index, fallback=True)
+                saved.append(info)
+            return saved
+        finally:
+            if must_close:
+                capture.release()
 
-        # if we opened a capture inside this function, close it
-        if must_close:
-            cap.release()
-        return captured_frames
-
-    # ---------- Step 3: Create PDF ----------
-    def create_pdf(self, image_files, output_name):
-        """
-        Take list of images (or list of metadata dicts containing 'file') and convert them
-        into a single PDF using img2pdf.
-        Returns the path to the PDF file on success, or None on failure.
-        """
-        # nothing to do if empty input
+    # ---------- PDF generation ----------
+    def create_pdf(self, image_files: Union[list[ImageInfo], list[PathLike]], output_name: str) -> Optional[str]:
+        """Create a PDF from saved frame metadata or a list of image file paths."""
         if not image_files:
             return None
 
-        # support both formats: list of filenames or list of dicts containing 'file'
         if isinstance(image_files[0], dict):
-            files = [d['file'] for d in image_files]
+            ordered_images = sorted(image_files, key=lambda item: float(item.get("time", 0.0)))
+            files = [str(item["file"]) for item in ordered_images if item.get("file")]
         else:
-            files = image_files
+            files = sorted(str(path) for path in image_files)
 
-        # sort filenames so pages appear in lexical order (slide_001, slide_002, ...)
-        files_sorted = sorted(files)
-        pdf_filename = f"{output_name}_notes.pdf"  # target PDF filename
-
-        try:
-            # open binary file and write pdf bytes produced by img2pdf
-            with open(pdf_filename, "wb") as f:
-                f.write(img2pdf.convert(files_sorted))
-            print(f"✅ PDF created: {pdf_filename}")
-            return pdf_filename
-        except Exception as e:
-            # log failure and return None to signal the error
-            print(f"❌ PDF creation error: {e}")
+        files = [file for file in files if Path(file).is_file()]
+        if not files:
             return None
 
-    # ---------- Step 4: Main pipeline ----------
-    def process_video_to_pdf(self, video_url, content_name):
-        """
-        High-level wrapper that:
-          1. Downloads the video from the URL
-          2. Extracts the best frames
-          3. Creates a PDF from those frames
-          4. Cleans up the downloaded video file
-        Returns the created PDF path, or None on failure.
-        """
-        print("🚀 Starting video processing...")
-        start_time = time.time()  # start timing to report runtime later
-
-        # Step 1: download video with yt_dlp
-        video_file = self.download_video(video_url, content_name)
-        if not video_file:
-            return None  # download failed -> abort
-
-        # Step 2: extract best frames from the downloaded video
-        frames_info = self.extract_best_frames(video_file, content_name)
-        if not frames_info:
-            return None  # extraction failed or returned no frames
-
-        # Step 3: create PDF from extracted frame files
-        pdf_file = self.create_pdf(frames_info, content_name)
-
-        # Cleanup: remove downloaded video file to save disk space
+        pdf_path = self._create_workspace() / f"{self._safe_filename(output_name)}_notes.pdf"
         try:
-            if os.path.exists(video_file):
-                os.remove(video_file)
-                print(f"🧹 Cleaned up: {video_file}")
-        except:
-            # if cleanup fails, we ignore it (not critical)
-            pass
+            with pdf_path.open("wb") as pdf_file:
+                pdf_file.write(img2pdf.convert(files))
+            print(f"✅ PDF created: {pdf_path}")
+            return str(pdf_path)
+        except Exception as error:
+            self.last_error = f"PDF creation failed: {error}"
+            print(f"❌ {self.last_error}")
+            return None
 
-        # log processing time and return the pdf path
-        processing_time = time.time() - start_time
-        print(f"⏱️ Total processing time: {processing_time:.1f} seconds")
-        return pdf_file
+    # ---------- Main pipeline ----------
+    def process_video_to_pdf(self, video_url: str, content_name: str, quality: str = "720p") -> Optional[str]:
+        """Download a video, extract frames, create a PDF, and remove the source video."""
+        print("🚀 Starting video processing...")
+        start_time = time.time()
+        self.last_error = None
+        self.processing_stats.update({"total_frames": 0, "key_frames": 0, "video_duration": 0.0})
+        self._create_workspace()
+
+        video_file = self.download_video(video_url, content_name, quality)
+        if not video_file:
+            return None
+
+        try:
+            frames_info = self.extract_best_frames(video_file, content_name)
+            if not frames_info:
+                self.last_error = "No readable frames could be extracted from the video."
+                return None
+            return self.create_pdf(frames_info, content_name)
+        finally:
+            # The input video is typically much larger than the result and is no longer needed.
+            try:
+                Path(video_file).unlink(missing_ok=True)
+            except OSError:
+                pass
+            print(f"⏱️ Total processing time: {time.time() - start_time:.1f} seconds")

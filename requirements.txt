@@ -1,0 +1,7 @@
+streamlit>=1.36,<2
+opencv-python-headless>=4.9,<5
+img2pdf>=0.5,<1
+yt-dlp>=2025.1.15
+pytesseract>=0.3.10,<1
+numpy>=1.26,<3
+Pillow>=10,<12

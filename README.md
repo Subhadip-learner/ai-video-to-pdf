@@ -45,14 +45,14 @@ This class encapsulates the entire logic for converting a video into a PDF of ke
 
 - Initializes `processing_stats` to track video duration, total frames, and key frames extracted.
 
-##### 🔍 Utility Methods (Not Shown, But Assumed)
-The class relies on the following internal helper methods (not shown in your code snippet but referenced):
-- `_frame_sharpness(frame)`: Computes Laplacian variance to measure sharpness.
-- `_edge_density(frame)`: Measures structural complexity (edges per pixel).
-- `_text_amount(frame)`: Uses `pytesseract` to extract and count text characters.
-- `_histogram(frame)`: Converts frame to HSV and computes a normalized color histogram.
-- `_hist_correlation(hist1, hist2)`: Computes histogram correlation (0–1) for similarity.
-- `_is_new_better(new_info, last_saved)`: Compares sharpness, edge density, and text to decide if a new frame should replace a similar one.
+##### 🔍 Frame-analysis Utility Methods
+The processor implements the following internal helpers:
+- `_frame_sharpness(frame)`: Computes Laplacian variance to measure focus.
+- `_edge_density(frame)`: Measures structural complexity as edge pixels per pixel.
+- `_text_amount(frame)`: Uses `pytesseract` to extract and count text characters when Tesseract is installed.
+- `_histogram(frame)`: Converts a frame to HSV and computes a normalized color histogram.
+- `_hist_correlation(hist1, hist2)`: Calculates visual similarity between two histograms.
+- `_is_new_better(new_info, last_saved)`: Prefers a sharper, more text-rich, or clearer structurally similar frame.
 
 ##### 🖼️ Frame Extraction (`extract_best_frames`)
 1. **Video Metadata Extraction**: Uses OpenCV to get FPS, total frames, and duration.
@@ -89,7 +89,7 @@ The class relies on the following internal helper methods (not shown in your cod
   - YouTube URL
   - Content name (for PDF filename)
   - Video quality (1080p–360p)
-  - Optional training PDF (currently unused in backend)
+  - Processing feedback and a PDF download button
 
 #### 🔄 Processing Flow
 1. **Input Validation**: Ensures URL is provided and contains YouTube domain.
@@ -134,9 +134,10 @@ video-to-pdf-app/
 ├── video_processor.py        # Core processing logic
 │
 ├── requirements.txt          # Python dependencies
+├── Dockerfile.vercel         # Vercel container configuration
+├── tests/                    # Offline processor tests
 ├── README.md                 # Project overview & usage instructions
-├── LICENSE                   # MIT License (optional but recommended)
-└── .gitignore                # Ignore venv, cache, etc.
+└── .gitignore                # Ignore venv and generated conversion files
 ```
 
 
@@ -178,6 +179,30 @@ Follow system-specific instructions above.
 ```bash
 streamlit run streamlit_app.py
 ```
+
+---
+
+## ▲ Deploy on Vercel (from GitHub)
+
+This repository includes a `Dockerfile.vercel` so Vercel can run the Streamlit server with the system tools required by the processor (`ffmpeg` and Tesseract OCR).
+
+1. Push the completed project to GitHub. Do not commit generated videos, slide folders, PDFs, virtual environments, or `.env` files.
+2. In Vercel, choose **Add New → Project**, import this repository, and retain the repository root (`./`) as the root directory.
+3. Vercel detects `Dockerfile.vercel` at the project root. Use the container/Other preset rather than a standard Python function; do not override the Docker build command.
+4. Click **Deploy**. Future pushes to the selected production branch deploy automatically.
+
+The app writes each job's downloaded video, slides, and final PDF to an isolated temporary directory below `/tmp/ai-video-to-pdf`, rather than the deployed source directory. The downloaded source video is deleted once processing completes.
+
+> **Vercel Hobby limitation:** keep videos short and choose 360p or 480p. Video downloading and OpenCV processing are CPU- and storage-intensive; jobs that exceed the platform timeout or temporary-storage allowance will fail. Use a dedicated worker host and object storage for long lectures or multiple simultaneous users.
+
+### Local container test
+
+```bash
+docker build -f Dockerfile.vercel -t ai-video-to-pdf .
+docker run --rm -p 8501:80 ai-video-to-pdf
+```
+
+Then open `http://localhost:8501`.
 
 ---
 
