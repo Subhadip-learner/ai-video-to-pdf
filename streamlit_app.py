@@ -3,7 +3,7 @@ import streamlit as st
 
 # Standard library imports for file and time handling
 import os           # for checking file existence and removing files
-import tempfile     # (not used currently but often used for temp files)
+import tempfile     # for staging uploaded videos before processing
 import time         # to create timestamps and measure durations
 
 # Import the processor class from video_processor and alias it so your app uses "OptimizedVideoProcessor"
@@ -172,6 +172,14 @@ def main():
                     placeholder="e.g., Machine_Learning_Lecture_1",
                     help="This will be used as the filename for your PDF"
                 )
+
+                # Direct upload fallback for videos that can't be downloaded
+                # (e.g. YouTube bot checks blocking the server's IP address).
+                uploaded_video = st.file_uploader(
+                    "**Or upload a video file**",
+                    type=["mp4", "mkv", "webm", "avi", "mov", "m4v", "mpeg", "mpg"],
+                    help="If the YouTube download fails, download the video yourself and upload it here instead"
+                )
             
             # Right column: processing settings and optional training PDF
             with col2:
@@ -255,17 +263,18 @@ def main():
     # Processing logic triggered on form submit
     # -----------------------
     if submitted:
-        # Validate user input: URL must be present
-        if not video_url:
-            st.error("❌ Please enter a valid YouTube URL.")
+        # Validate user input: need either a URL or an uploaded file
+        if not video_url and uploaded_video is None:
+            st.error("❌ Please enter a YouTube URL or upload a video file.")
             return  # early return to stop the function
         
         # If user didn't provide a content name, create a timestamp-based fallback name
         if not content_name:
             content_name = f"smart_notes_{int(time.time())}"
         
-        # Quick URL format check (not exhaustive) - warn but continue
-        if "youtube.com" not in video_url and "youtu.be" not in video_url:
+        # Quick URL format check (not exhaustive) - warn but continue.
+        # Skipped when the user uploaded a file instead of pasting a URL.
+        if video_url and "youtube.com" not in video_url and "youtu.be" not in video_url:
             st.warning("⚠️ Please check the YouTube URL (must contain youtube.com or youtu.be)")
         
         # Wrap the heavy processing in try/except to show errors in UI instead of crashing
@@ -315,8 +324,22 @@ def main():
                 update(0); time.sleep(1)
                 processor = OptimizedVideoProcessor()  # instantiate the video processor
 
-                # Run the full processing pipeline (downloads video, extracts frames, creates PDF)
-                pdf_output = processor.process_video_to_pdf(video_url, content_name, quality=quality)
+                # Run the full processing pipeline.
+                # Uploaded files skip the YouTube download entirely.
+                if uploaded_video is not None:
+                    suffix = os.path.splitext(uploaded_video.name)[1] or ".mp4"
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                        tmp.write(uploaded_video.getbuffer())
+                        staged_path = tmp.name
+                    try:
+                        pdf_output = processor.process_file_to_pdf(staged_path, content_name)
+                    finally:
+                        try:
+                            os.remove(staged_path)
+                        except OSError:
+                            pass
+                else:
+                    pdf_output = processor.process_video_to_pdf(video_url, content_name, quality=quality)
                 
                 # After run, check if a PDF was created and exists on disk
                 if pdf_output and os.path.exists(pdf_output):

@@ -7,6 +7,7 @@ the deployed application directory is read-only and only ``/tmp`` can be written
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import tempfile
@@ -194,7 +195,20 @@ class SimpleVideoProcessor:
             "socket_timeout": 30,
             "retries": 2,
             "fragment_retries": 2,
+            # Hosted servers (Vercel, etc.) share datacenter IPs that YouTube's
+            # web player often flags as bots.  The mobile player clients are
+            # far less aggressive about that check, so prefer them.
+            "extractor_args": {"youtube": {"player_client": ["android", "ios", "web"]}},
         }
+
+        # Optional backup for strict bot checks: paste a Netscape-format
+        # cookies.txt export into the YTDLP_COOKIES environment variable and
+        # yt-dlp will authenticate with it.  Never commit cookies to git.
+        cookie_data = os.environ.get("YTDLP_COOKIES", "").strip()
+        if cookie_data:
+            cookie_file = workspace / "cookies.txt"
+            cookie_file.write_text(cookie_data)
+            options["cookiefile"] = str(cookie_file)
 
         try:
             with yt_dlp.YoutubeDL(options) as downloader:
@@ -432,6 +446,14 @@ class SimpleVideoProcessor:
             return None
 
     # ---------- Main pipeline ----------
+    def _build_pdf_from_file(self, video_file: PathLike, content_name: str) -> Optional[str]:
+        """Extract frames from a local video file and build the PDF."""
+        frames_info = self.extract_best_frames(video_file, content_name)
+        if not frames_info:
+            self.last_error = "No readable frames could be extracted from the video."
+            return None
+        return self.create_pdf(frames_info, content_name)
+
     def process_video_to_pdf(self, video_url: str, content_name: str, quality: str = "720p") -> Optional[str]:
         """Download a video, extract frames, create a PDF, and remove the source video."""
         print("🚀 Starting video processing...")
@@ -445,15 +467,33 @@ class SimpleVideoProcessor:
             return None
 
         try:
-            frames_info = self.extract_best_frames(video_file, content_name)
-            if not frames_info:
-                self.last_error = "No readable frames could be extracted from the video."
-                return None
-            return self.create_pdf(frames_info, content_name)
+            return self._build_pdf_from_file(video_file, content_name)
         finally:
             # The input video is typically much larger than the result and is no longer needed.
             try:
                 Path(video_file).unlink(missing_ok=True)
             except OSError:
                 pass
+            print(f"⏱️ Total processing time: {time.time() - start_time:.1f} seconds")
+
+    def process_file_to_pdf(self, local_path: PathLike, content_name: str) -> Optional[str]:
+        """Build a PDF from an already-downloaded video file (e.g. a user upload).
+
+        This path never touches YouTube, so it works even when the hosting
+        provider's IP range is blocked by the video site's bot checks.
+        """
+        print("🚀 Starting video processing...")
+        start_time = time.time()
+        self.last_error = None
+        self.processing_stats.update({"total_frames": 0, "key_frames": 0, "video_duration": 0.0})
+        self._create_workspace()
+
+        source = Path(str(local_path))
+        if not source.is_file():
+            self.last_error = "The uploaded video file could not be read."
+            return None
+
+        try:
+            return self._build_pdf_from_file(source, content_name)
+        finally:
             print(f"⏱️ Total processing time: {time.time() - start_time:.1f} seconds")

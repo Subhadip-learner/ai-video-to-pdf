@@ -84,6 +84,25 @@ class VideoProcessorTests(unittest.TestCase):
         self.assertTrue(all("fallback_" in Path(frame["file"]).name for frame in frames))
         processor.cleanup()
 
+    def test_process_file_to_pdf_accepts_a_local_video(self):
+        original_ocr_setting = video_processor.OCR_AVAILABLE
+        video_processor.OCR_AVAILABLE = False
+        self.addCleanup(setattr, video_processor, "OCR_AVAILABLE", original_ocr_setting)
+
+        processor = SimpleVideoProcessor(capture_interval_seconds=0.5, min_sharpness=1)
+        pdf_path = processor.process_file_to_pdf(self.video_path, "local upload")
+        self.addCleanup(processor.cleanup)
+
+        self.assertIsNotNone(pdf_path)
+        self.assertEqual(Path(pdf_path).read_bytes()[:4], b"%PDF")
+        self.assertGreaterEqual(processor.stats["key_frames"], 3)
+
+    def test_process_file_to_pdf_rejects_a_missing_file(self):
+        processor = SimpleVideoProcessor()
+        self.addCleanup(processor.cleanup)
+        self.assertIsNone(processor.process_file_to_pdf("/tmp/does-not-exist.mp4", "notes"))
+        self.assertEqual(processor.last_error, "The uploaded video file could not be read.")
+
     def test_empty_video_url_does_not_start_a_download(self):
         processor = SimpleVideoProcessor()
         self.assertIsNone(processor.download_video("", "notes"))
